@@ -1,0 +1,72 @@
+name: "Aur Package Action"
+description: "Builds ArchLinux Packages"
+
+inputs:
+  repo:
+    description: "package repo"
+    required: true
+  gpg-key:
+    description: "gpg signing key"
+    required: true
+  gpg-passphrase:
+    description: "gpg passphrase"
+    required: true
+  ssh-key:
+    description: "boxit user ssh private key"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: build package
+      shell: bash
+      run: |
+        # "build package"
+        cd /home/builder/
+        git clone https://aur.archlinux.org/${{ github.event.client_payload.repo }}.git
+        chown -R builder ${{ github.event.client_payload.repo }}
+        gitfolder=$(find -type f -name PKGBUILD | sed 's/PKGBUILD//')
+        cd $gitfolder
+
+        ${{ github.event.client_payload.command }}
+        ${{ inputs.extracommand }}
+
+        aur-x86_64-build -c -- -U builder || extra-x86_64-build -c -- -U builder
+    - name: Rename Package
+      shell: bash -O extglob {0}
+      run: |
+        # "Rename Package"
+        #for i in $(find -type f -name PKGBUILD | sed 's/PKGBUILD//'); do
+        #cd $i
+        cd /home/builder/
+        gitfolder=$(find -type f -name PKGBUILD | sed 's/PKGBUILD//')
+        cd $gitfolder
+        for i in *.zst; do if [ -n "$(ls $i | grep :)" ]; then mv $i $(echo $i | sed 's/:/-/'); fi; done
+        #done
+
+    - name: sign package
+      shell: bash -O extglob {0}
+      run: |
+        cd /home/builder/
+        # "Assinar Pacote"
+        cat <(echo -e "${{ inputs.gpg-key }}") | gpg --batch --import &>/dev/null
+        #for i in $(find -type f -name PKGBUILD | sed 's/PKGBUILD//'); do
+        #cd $i
+        gitfolder=$(find -type f -name PKGBUILD | sed 's/PKGBUILD//')
+        cd $gitfolder
+        for p in $(find $PWD -maxdepth 1 -regex '.*\.pkg\.tar\.\(xz\|zst\)'); do
+          gpg --pinentry-mode loopback --passphrase "${{ inputs.gpg-passphrase }}" --detach-sign ${p}
+        done
+    - name: CheckSum
+      shell: bash -O extglob {0}
+      run: |
+        cd /home/builder/
+        gitfolder=$(find -type f -name PKGBUILD | sed 's/PKGBUILD//')
+        cd $gitfolder
+        echo '#!/bin/bash
+        #file=$(find -type f -iname "*.zst" | cut -d "/" -f2)
+        #for i in *.zst *.sig; do test -e $i && md5sum $i >> "$file.md5"; done
+        for i in $(ls *.zst); do md5sum $i >> $i.md5; done
+        for i in $(ls *.sig | sed 's/.sig//'); do md5sum $i.sig >> $i.md5; done
+        exit 0' > md5.sh
+        bash md5.sh

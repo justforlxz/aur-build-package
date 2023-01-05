@@ -1,0 +1,198 @@
+name: Build Package
+
+# Controls when the workflow will run
+on:
+  repository_dispatch:
+    types:
+      - aur/*
+defaults:
+  run:
+    shell: bash
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+      volumes:
+        - /etc/machine-id:/etc/machine-id
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v3
+
+      #       - name: Telegram Alert Start
+      #         shell: bash
+      #         run: |
+      #           curl -X POST -H 'Content-Type: application/json' -d '{"chat_id": "${{ secrets.CHAT_ID }}", "text": "Criando ${{ github.event.action }} do repositório ${{ github.event.client_payload.branch }} enviado por ${{ github.actor }}", "disable_notification": true}' ${{ secrets.MESSAGE_BOT_KEY }}
+
+      - name: echo PayLoads
+        run: |
+          echo "url: ${{ github.event.client_payload.url }}"
+          echo "branch: ${{ github.event.client_payload.branch }}"
+          echo "extrarepo: ${{ github.event.client_payload.extrarepo }}"
+      - name: install build-dependencies
+        shell: bash
+        run: |
+          pacman-key --init
+          pacman-key --populate
+          # packager key
+          pacman-key -r AFAAFC4EF142770966FC4C805987B0C2A80EA669
+          pacman-key --lsign-key AFAAFC4EF142770966FC4C805987B0C2A80EA669
+          pacman -Syu --noconfirm --noprogressbar --needed archlinux-keyring openssh devtools gnupg git base-devel github-cli sshfs
+          ln -sf /usr/bin/archbuild /usr/bin/aur-x86_64-build
+          cp /usr/share/devtools/pacman-extra.conf /usr/share/devtools/pacman-aur.conf
+          echo '
+          [aur-testing]
+          SigLevel = PackageRequired
+          Server = https://repo.justforlxz.com:4433/testing/$arch' | tee -a /usr/share/devtools/pacman-aur.conf
+          echo '
+          [aur-stable]
+          SigLevel = PackageRequired
+          Server = https://repo.justforlxz.com:4433/stable/$arch' | tee -a /usr/share/devtools/pacman-aur.conf
+      - name: Create build user
+        run: |
+          useradd -m -g users builder -G wheel
+      - name: Makepkg Build and Check
+        id: makepkg
+        uses: justforlxz/aur-build-package@master
+        with:
+          package: pkgbuild
+          branch: stable
+          gitbranch: ${{ github.event.client_payload.branch }}
+          gpg-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: ${{ secrets.PASSPHRASE }}
+          extrarepo: ${{ github.event.client_payload.extrarepo }}
+      - name: Publish Package on GitHub
+        shell: bash
+        if: false
+        run: |
+          cd /home/builder/
+          gitfolder=$(find -type f -name PKGBUILD | sed 's/PKGBUILD//')
+          cd $gitfolder
+          ls -lh
+
+          #Release#
+          source PKGBUILD
+          release=${pkgname}-${pkgver}-${pkgrel}
+
+          if [ -n "$(echo ${{ github.event.client_payload.url }} | grep https://github.com/justforlxz/)" ]; then 
+            echo ${{ secrets.TOKEN_RELEASE }} | gh auth login --with-token
+            # token=${{ secrets.TOKEN_RELEASE }}
+            repo=$(echo ${{ github.event.client_payload.url }} | sed 's|https://github.com/||')
+          else
+            echo ${{ github.token }} | gh auth login --with-token
+            # token=${{ github.token }}
+            repo=${{ github.repository }}
+          fi
+
+          gh release create ${release} --title ${release} --repo ${repo} --notes "automated release from ${{ github.event.client_payload.url }}" || echo "release already exists"
+          GITHUB_LINK=https://github.com/${repo}/releases/download/${release}
+          for i in .zst .sig .tar .md5; do
+            find -iname "*$i" -exec gh release upload ${release} --repo ${repo} --clobber {} \;
+          done
+      - name: Set ssh
+        run: |
+          echo "## ssh setup"
+          mkdir -p /root/.ssh
+          touch /root/.ssh/github_actions
+          chmod 600 /root/.ssh/github_actions
+          #ssh-agent -a /tmp/ssh_agent.sock > /dev/null
+          echo "${{ secrets.PKGBUILD_KEY }}" >> /root/.ssh/github_actions
+          eval `ssh-agent -s`
+          cp /root/.ssh/github_actions /root/.ssh/id_rsa
+          ssh-add /root/.ssh/github_actions
+          ssh-add /root/.ssh/id_rsa
+          ssh-keyscan -t rsa -p ${{ secrets.PKGBUILD_PORT }} ${{ secrets.PKGBUILD_HOST }} >> /root/.ssh/known_hosts
+          ssh-keyscan -t rsa -H "github.com" >> /root/.ssh/known_hosts
+          git config --global user.email "bot@mkacg.com"
+          git config --global user.name "Bot"
+      - name: Lock
+        if: ${{ always() }}
+        run: |
+          for (( ; ; ))
+          do
+            rm -rf push-sleep
+            git clone git@github.com:deepin-community/push-sleep.git -b aur
+            cd push-sleep
+            if [[ -f "lock" ]];
+            then
+              sleep 10
+              continue
+            else
+              touch lock
+              echo ${{ github.event.client_payload.repo }} > lock
+              git add lock
+              git commit -m "lock ${{ github.event.client_payload.repo }}"
+              git push || continue
+              break
+            fi
+          done
+      - name: Push to Repo
+        shell: bash
+        run: |
+          cd /home/builder/
+          gitfolder=$(find -type f -name PKGBUILD | sed 's/PKGBUILD//')
+          cd $gitfolder
+          ls -lh
+          if [ -n "$(echo ${{ github.event.client_payload.branch }} | grep stable )" ];then branch=stable; else branch=testing; fi
+          for i in *.zst *.sig *.md5; do
+            [[ $i =~ .*-([^-.]+)\..* ]]
+            rsync -vapz -e "ssh -p ${{ secrets.PKGBUILD_PORT }}" $i ${{ secrets.PKGBUILD_USER }}@${{ secrets.PKGBUILD_HOST }}:${{ secrets.PKGBUILD_DIR }}/$branch/${BASH_REMATCH[1]}
+          done
+
+          mkdir sshfs
+
+          sshfs -p ${{ secrets.PKGBUILD_PORT }} ${{ secrets.PKGBUILD_USER }}@${{ secrets.PKGBUILD_HOST }}:${{secrets.PKGBUILD_DIR }} sshfs
+
+          for i in *.zst *.sig *.md5; do
+            [[ $i =~ .*-([^-.]+)\..* ]]
+            case ${BASH_REMATCH[1]} in
+              any)
+                pushd sshfs/${{ github.event.client_payload.branch }}/x86_64
+                    ln -sf ../any/$i .
+                popd
+                pushd sshfs/${{ github.event.client_payload.branch }}/aarch64
+                    ln -sf ../any/$i .
+                popd
+                ;;
+            esac
+          done
+
+          for i in *.zst; do
+            [[ $i =~ .*-([^-.]+)\..* ]]
+            case ${BASH_REMATCH[1]} in
+              any)
+                pushd sshfs/${{ github.event.client_payload.branch }}/x86_64/
+                  repo-add -n -R aur.db.tar.gz $i
+                popd
+                pushd sshfs/${{ github.event.client_payload.branch }}/aarch64/
+                  repo-add -n -R aur.db.tar.gz $i
+                popd
+                ;;
+              *)
+                pushd sshfs/${{ github.event.client_payload.branch }}/${BASH_REMATCH[1]}
+                  repo-add -n -R aur.db.tar.gz $i
+                popd
+                ;;
+            esac
+          done
+
+          exit 0
+      - name: Lock
+        if: ${{ always() }}
+        run: |
+          cd push-sleep
+          if [[ -f lock ]]; then
+            git reset HEAD^
+            rm -rf lock
+            git push -f
+          fi
+      - name: Telegram Alert Fail
+        if: ${{ failure() || cancelled() }}
+        run: |
+          curl -X POST -H 'Content-Type: application/json' -d '{"chat_id": "${{ secrets.CHAT_ID }}", "text": "Failed to create package: ${{ github.event.action }} from branch ${{ github.ref_name }}, error link: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}", "disable_notification": false}' ${{ secrets.MESSAGE_BOT_KEY }}
